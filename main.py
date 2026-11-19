@@ -1,33 +1,9 @@
 #!/usr/bin/env python3
-"""
-spex-shell — desktop feito de shell, iniciado do shell.
-Estética hacker/TTY: verde-fósforo, glow, mono.
 
-- Fullscreen, fundo preto, sem chrome, sem mouse.
-- N shells reais (PTY + fork) em tiling: master-stack, colunas, linhas, grid.
-- Teclado 100%: prefixo Ctrl+B (estilo tmux).
-- Fonte "hacker de filme" auto-detectada (VT323, Fixedsys, IBM VGA, ...).
-- Glow verde no texto, cursor âmbar, scanline CRT no cabeçalho.
-
-Uso:
-    spex-shell
-    spex-shell --shell /bin/zsh --font VT323 --size 18
-    spex-shell --args -l
-
-Prefix = Ctrl+B:
-  c novo painel        q fechar painel (renasce se for o último)
-  Q ou x desligar o SISTEMA (com confirmação)
-  h/j/k/l foco         n/p ciclo        t layout
-  z zoom               r renomear
-
-Env vars:
-  SPEX_SHELL   shell padrão
-  SPEX_FONT    fonte
-  SPEX_SIZE    tamanho da fonte
-"""
 import os
 import sys
 import pty
+import time
 import fcntl
 import signal
 import struct
@@ -38,6 +14,7 @@ import subprocess
 from PyQt6.QtCore import Qt, QTimer, QSocketNotifier, QRect
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QColor, QPainter, QKeyEvent, QPen, QFontDatabase,
+    QClipboard,
 )
 from PyQt6.QtWidgets import QApplication, QWidget, QInputDialog
 
@@ -82,6 +59,8 @@ COL_BORDER_OFF = QColor(0,   45,  20)
 COL_SEP        = QColor(0,   35,  15)
 COL_WARN       = QColor(255, 80, 80)
 COL_PROMPT_BG  = QColor(40, 0, 0)
+COL_SEL        = QColor(60, 255, 120, 85)    # seleção de texto
+COL_COPY_CUR   = QColor(255, 190, 60, 170)   # cursor do modo cópia
 
 SAFE_TOP    = 6
 SAFE_BOTTOM = 4
@@ -139,16 +118,23 @@ class Pty:
             pass
 
     def read(self):
+        """bytes = dados; b"" = nada agora; None = shell terminou (EOF)."""
         try:
-            return os.read(self.fd, 65536)
-        except (BlockingIOError, OSError):
+            data = os.read(self.fd, 65536)
+        except BlockingIOError:
             return b""
-
-    def write(self, data):
-        try:
-            os.write(self.fd, data)
         except OSError:
-            pass
+            return None
+        return data if data else None
+
+    def write_some(self, data):
+        """Escreve o que couber sem travar. Retorna quantos bytes saíram."""
+        try:
+            return os.write(self.fd, data)
+        except BlockingIOError:
+            return 0
+        except OSError:
+            return len(data)   # shell morto: descarta
 
     def close(self):
         for sig in (signal.SIGHUP, signal.SIGTERM):
@@ -190,9 +176,23 @@ class Pane(QWidget):
         self.grid = [[" "] * self.cols for _ in range(self.rows)]
         self.cx = self.cy = 0
 
+        # ---- seleção / modo cópia ----
+        self.sel_start = None     # (linha, coluna)
+        self.sel_end = None
+        self.copy_mode = False
+        self.copy_x = 0
+        self.copy_y = 0
+
         self.pty = Pty(shell, args, self.rows, self.cols)
         self.notifier = QSocketNotifier(self.pty.fd, QSocketNotifier.Type.Read, self)
         self.notifier.activated.connect(self._on_readable)
+
+        # escrita assíncrona (colar texto grande sem travar a interface)
+        self._wbuf = bytearray()
+        self.wnotifier = QSocketNotifier(self.pty.fd, QSocketNotifier.Type.Write, self)
+        self.wnotifier.setEnabled(False)
+        self.wnotifier.activated.connect(self._flush)
+        self._born = time.monotonic()
 
         self._cursor_on = True
         self._blink = QTimer(self)
@@ -203,12 +203,34 @@ class Pane(QWidget):
 
     def _on_readable(self):
         data = self.pty.read()
+        if data is None:
+            # shell terminou: para de ouvir (senão o loop fica girando e congela)
+            self.shutdown()
+            if time.monotonic() - self._born > 2.0:
+                QTimer.singleShot(0, lambda: self.wm.remove_pane(self))
+            else:
+                self.wm._set_status(
+                    "o shell terminou logo ao iniciar (confira --shell). "
+                    "Ctrl+B q fecha o painel", 6000)
+            return
         if data:
             self._feed(data)
             self.update()
 
     def send_bytes(self, data):
-        self.pty.write(data)
+        self._wbuf += data
+        self._flush()
+
+    def _flush(self):
+        if self._wbuf:
+            n = self.pty.write_some(bytes(self._wbuf))
+            del self._wbuf[:n]
+        self.wnotifier.setEnabled(bool(self._wbuf))
+
+    def shutdown(self):
+        self.notifier.setEnabled(False)
+        self.wnotifier.setEnabled(False)
+        self._wbuf.clear()
 
     def _feed(self, data: bytes):
         i, n = 0, len(data)
@@ -281,8 +303,88 @@ class Pane(QWidget):
             self.grid = new_grid
             self.cx = min(self.cx, cols - 1)
             self.cy = min(self.cy, rows - 1)
+            self.copy_x = min(self.copy_x, cols - 1)
+            self.copy_y = min(self.copy_y, rows - 1)
+            self.clear_selection()
             self.pty.resize(rows, cols)
 
+    # ---------- seleção / cópia ----------
+    def clear_selection(self):
+        self.sel_start = None
+        self.sel_end = None
+        self.update()
+
+    def _sel_range(self):
+        """Retorna ((l1, c1), (l2, c2)) já ordenado, ou None."""
+        if self.sel_start is None or self.sel_end is None:
+            return None
+        a, b = sorted([self.sel_start, self.sel_end])
+        return a, b
+
+    def selected_text(self) -> str:
+        rng = self._sel_range()
+        if not rng:
+            return ""
+        (r1, c1), (r2, c2) = rng
+        lines = []
+        for r in range(r1, r2 + 1):
+            if r >= len(self.grid):
+                break
+            a = c1 if r == r1 else 0
+            b = c2 if r == r2 else self.cols - 1
+            lines.append("".join(self.grid[r][a:b + 1]).rstrip())
+        return "\n".join(lines).rstrip("\n")
+
+    def enter_copy_mode(self):
+        self.copy_mode = True
+        self.copy_x, self.copy_y = self.cx, self.cy
+        self.clear_selection()
+
+    def exit_copy_mode(self):
+        self.copy_mode = False
+        self.clear_selection()
+
+    def toggle_anchor(self):
+        if self.sel_start is None:
+            self.sel_start = self.sel_end = (self.copy_y, self.copy_x)
+            self.update()
+        else:
+            self.clear_selection()
+
+    def move_copy_cursor(self, dx, dy):
+        self.copy_x = max(0, min(self.cols - 1, self.copy_x + dx))
+        self.copy_y = max(0, min(self.rows - 1, self.copy_y + dy))
+        if self.sel_start is not None:
+            self.sel_end = (self.copy_y, self.copy_x)
+        self.update()
+
+    # ---------- mouse (só para selecionar) ----------
+    def _cell_at(self, pos):
+        y0 = self.HEADER + 2 * self.PAD
+        x = (pos.x() - self.PAD) // self._cw
+        y = (pos.y() - y0) // self._ch
+        return (max(0, min(self.rows - 1, y)), max(0, min(self.cols - 1, x)))
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.wm.focus_pane(self)
+            self.sel_start = self.sel_end = self._cell_at(ev.position().toPoint())
+            self.update()
+
+    def mouseMoveEvent(self, ev):
+        if ev.buttons() & Qt.MouseButton.LeftButton and self.sel_start is not None:
+            self.sel_end = self._cell_at(ev.position().toPoint())
+            self.update()
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+        if self.sel_start == self.sel_end:
+            self.clear_selection()          # clique simples, sem arrastar
+        else:
+            self.wm.copy_selection()        # arrastou: já copia
+
+    # ---------- desenho ----------
     def _draw_glow_text(self, p: QPainter, x: int, y: int, text: str,
                         color: QColor, glow: QColor):
         p.setPen(glow)
@@ -301,6 +403,8 @@ class Pane(QWidget):
         header_rect = QRect(0, 0, self.width(), self.HEADER + self.PAD)
         p.fillRect(header_rect, COL_HEADER_BG)
         title = f"[{self.index}] {self.title}"
+        if self.copy_mode:
+            title += "  -- MODO CÓPIA --"
         if self.active:
             self._draw_glow_text(p, self.PAD, self.HEADER - 2, title,
                                  COL_HEADER_FG, COL_GLOW)
@@ -312,6 +416,20 @@ class Pane(QWidget):
         p.drawLine(0, self.HEADER + self.PAD, self.width(), self.HEADER + self.PAD)
 
         y0 = self.HEADER + 2 * self.PAD
+
+        # ---- seleção (por baixo do texto) ----
+        rng = self._sel_range()
+        if rng:
+            (r1, c1), (r2, c2) = rng
+            for r in range(r1, r2 + 1):
+                a = c1 if r == r1 else 0
+                b = c2 if r == r2 else self.cols - 1
+                p.fillRect(
+                    QRect(self.PAD + a * self._cw, y0 + r * self._ch,
+                          (b - a + 1) * self._cw, self._ch),
+                    COL_SEL,
+                )
+
         fg = COL_FG if self.active else COL_FG_DIM
         for y, row in enumerate(self.grid):
             text = "".join(row).rstrip()
@@ -324,7 +442,8 @@ class Pane(QWidget):
                 p.setPen(fg)
                 p.drawText(self.PAD, baseline, text)
 
-        if self._cursor_on and self.active:
+        # ---- cursor normal (some no modo cópia) ----
+        if self._cursor_on and self.active and not self.copy_mode:
             r = QRect(
                 self.PAD + self.cx * self._cw,
                 y0 + self.cy * self._ch,
@@ -336,6 +455,16 @@ class Pane(QWidget):
             if ch != " ":
                 p.setPen(QColor(0, 0, 0))
                 p.drawText(r.left() + 1, r.bottom() - self._fm.descent(), ch)
+
+        # ---- cursor do modo cópia ----
+        if self.copy_mode and self.active:
+            r = QRect(
+                self.PAD + self.copy_x * self._cw,
+                y0 + self.copy_y * self._ch,
+                self._cw,
+                self._ch,
+            )
+            p.fillRect(r, COL_COPY_CUR)
 
         p.setPen(QPen(COL_BORDER_ON if self.active else COL_BORDER_OFF, 1))
         p.drawRect(self.rect().adjusted(0, 0, -1, -1))
@@ -413,6 +542,7 @@ class SpexShell(QWidget):
             return
         idx = self.panes.index(pane)
         self.panes.pop(idx)
+        pane.shutdown()
         pane.pty.close()
         pane.close()
         pane.deleteLater()
@@ -437,6 +567,38 @@ class SpexShell(QWidget):
             return
         self.focus = (self.focus + d) % len(self.panes)
         self._update_active()
+
+    def focus_pane(self, pane):
+        if pane in self.panes:
+            self.focus = self.panes.index(pane)
+            self._update_active()
+
+    # ---------- copiar / colar ----------
+    def copy_selection(self):
+        if not self.panes:
+            return
+        text = self.panes[self.focus].selected_text()
+        if not text:
+            self._set_status("nada selecionado", 1200)
+            return
+        cb = QApplication.clipboard()
+        cb.setText(text, QClipboard.Mode.Clipboard)
+        if cb.supportsSelection():
+            cb.setText(text, QClipboard.Mode.Selection)
+        self._set_status(f"copiado ({len(text)} caracteres)", 1500)
+
+    def paste_clipboard(self):
+        if not self.panes:
+            return
+        text = QApplication.clipboard().text()
+        if not text:
+            self._set_status("área de transferência vazia", 1200)
+            return
+        # Enter no terminal é \r
+        text = text.replace("\r\n", "\n").replace("\n", "\r")
+        pane = self.panes[self.focus]
+        pane.clear_selection()
+        pane.send_bytes(text.encode("utf-8"))
 
     # ---------- geometria / layout ----------
     def _usable_rect(self):
@@ -579,19 +741,76 @@ class SpexShell(QWidget):
             self._cancel_shutdown()
             return
 
+        # ---- modo cópia: teclas são só para navegar/selecionar ----
+        if self.panes and self.panes[self.focus].copy_mode:
+            self.prefix_pressed = False
+            self._handle_copy_mode(ev)
+            return
+
         if self.prefix_pressed:
             self.prefix_pressed = False
             self._handle_prefix(ev)
             return
 
-        ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
-        if ctrl and ev.key() == Qt.Key.Key_B:
+        mods = ev.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        key = ev.key()
+
+        if ctrl and not shift and key == Qt.Key.Key_B:
             self.prefix_pressed = True
+            return
+
+        # ---- atalhos de copiar / colar ----
+        if ctrl and shift and key == Qt.Key.Key_C:
+            self.copy_selection()
+            return
+        if (ctrl and shift and key == Qt.Key.Key_V) or \
+           (shift and not ctrl and key == Qt.Key.Key_Insert):
+            self.paste_clipboard()
             return
 
         data = self._key_to_bytes(ev)
         if data and self.panes:
+            self.panes[self.focus].clear_selection()
             self.panes[self.focus].send_bytes(data)
+
+    def _handle_copy_mode(self, ev: QKeyEvent):
+        pane = self.panes[self.focus]
+        k = ev.key()
+        t = ev.text()
+
+        # sair sem copiar
+        if k in (Qt.Key.Key_Escape, Qt.Key.Key_Q):
+            pane.exit_copy_mode()
+            return
+        # copiar e sair
+        if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Y):
+            self.copy_selection()
+            pane.exit_copy_mode()
+            return
+        # começa / cancela seleção
+        if k in (Qt.Key.Key_Space, Qt.Key.Key_V):
+            pane.toggle_anchor()
+            return
+
+        # movimento
+        if t == "G":
+            pane.move_copy_cursor(0, 9999)
+        elif t == "g":
+            pane.move_copy_cursor(0, -9999)
+        elif t == "$" or k == Qt.Key.Key_End:
+            pane.move_copy_cursor(9999, 0)
+        elif t == "0" or k == Qt.Key.Key_Home:
+            pane.move_copy_cursor(-9999, 0)
+        elif k in (Qt.Key.Key_H, Qt.Key.Key_Left):
+            pane.move_copy_cursor(-1, 0)
+        elif k in (Qt.Key.Key_L, Qt.Key.Key_Right):
+            pane.move_copy_cursor(1, 0)
+        elif k in (Qt.Key.Key_K, Qt.Key.Key_Up):
+            pane.move_copy_cursor(0, -1)
+        elif k in (Qt.Key.Key_J, Qt.Key.Key_Down):
+            pane.move_copy_cursor(0, 1)
 
     def _handle_prefix(self, ev):
         k = ev.key()
@@ -611,6 +830,13 @@ class SpexShell(QWidget):
         # ---- resto ----
         if k == Qt.Key.Key_C:
             self.add_pane()
+        elif k == Qt.Key.Key_BracketLeft:
+            if self.panes:
+                self.panes[self.focus].enter_copy_mode()
+        elif k == Qt.Key.Key_BracketRight:
+            self.paste_clipboard()
+        elif k == Qt.Key.Key_Y:
+            self.copy_selection()
         elif k in (Qt.Key.Key_H, Qt.Key.Key_K):
             self._move_focus(-1)
         elif k in (Qt.Key.Key_L, Qt.Key.Key_J, Qt.Key.Key_N):
